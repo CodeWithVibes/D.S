@@ -161,26 +161,26 @@ async function runLoop(
 	streamFn?: StreamFn,
 ): Promise<void> {
 	let firstTurn = true;
-	// Check for steering messages at start (user may have typed while waiting)
-	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
+	let hasEditedFiles = false;
+	let textOnlyNudges = 0;
+	const MAX_TEXT_ONLY_NUDGES = 2;
 
-	// tau/sn66 v15.1: provider-error retry. Verified in local smoke test
-	// (smoke-batch-2): Gemini Flash via tau OpenRouter proxy intermittently
-	// returns finish_reason=error mid-stream, leaving the partial assistant
-	// message in context with no tool calls. Without retry the agent exits
-	// with 0 edits and produces an empty diff. With retry we inject a
-	// continuation prompt and try again.
+	// tau/sn66: provider-error retry. Gemini Flash via OpenRouter proxy
+	// intermittently returns finish_reason=error mid-stream, leaving the
+	// partial assistant message with no tool calls. Without retry the agent
+	// exits with 0 edits. With retry we inject a continuation prompt.
 	let providerErrorRetries = 0;
 	const MAX_PROVIDER_ERROR_RETRIES = 3;
 
-	// tau/sn66 v15.2: consecutive edit-error detector. Verified in local smoke
-	// test (smoke-batch-3): the model can hallucinate oldText and get stuck in
-	// a retry loop on a single file, burning the entire 300s budget on one
-	// file while leaving 12 other files in the task untouched. After N edit
-	// errors on the same file, force the model to move on.
+	// tau/sn66: consecutive edit-error detector. The model can hallucinate
+	// oldText and get stuck retrying the same file, burning the entire budget.
+	// After N edit errors on the same file, force the model to move on.
 	const editErrorsByFile = new Map<string, number>();
 	const stuckFilesAlerted = new Set<string>();
 	const EDIT_ERROR_THRESHOLD_PER_FILE = 3;
+
+	// Check for steering messages at start (user may have typed while waiting)
+	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
 
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
@@ -215,8 +215,8 @@ async function runLoop(
 				return;
 			}
 
-			// tau/sn66 v15.1: provider error → inject continuation and retry
-			// instead of exiting. Caps at 3 retries to avoid infinite loops.
+			// tau/sn66: provider error → inject continuation and retry
+			// instead of exiting with 0 edits. Caps at 3 retries.
 			if (message.stopReason === "error") {
 				if (providerErrorRetries < MAX_PROVIDER_ERROR_RETRIES) {
 					providerErrorRetries++;
@@ -245,6 +245,12 @@ async function runLoop(
 
 			const toolResults: ToolResultMessage[] = [];
 			if (hasMoreToolCalls) {
+				// Track if any edit/write tool was called
+				for (const tc of toolCalls) {
+					if (tc.type === "toolCall" && (tc.name === "edit" || tc.name === "write")) {
+						hasEditedFiles = true;
+					}
+				}
 				toolResults.push(...(await executeToolCalls(currentContext, message, config, signal, emit)));
 
 				for (const result of toolResults) {
@@ -252,7 +258,7 @@ async function runLoop(
 					newMessages.push(result);
 				}
 
-				// tau/sn66 v15.2: track consecutive edit failures per file.
+				// tau/sn66: track consecutive edit failures per file.
 				// When the same file accumulates >= threshold edit errors,
 				// inject a steering message to force the model off that file.
 				for (let i = 0; i < toolResults.length; i++) {
@@ -283,6 +289,25 @@ async function runLoop(
 						editErrorsByFile.set(targetPath, 0);
 					}
 				}
+			}
+
+			// If model returned text-only (no tool calls) and hasn't edited files yet,
+			// nudge it to make edits instead of just planning
+			if (!hasMoreToolCalls && !hasEditedFiles && textOnlyNudges < MAX_TEXT_ONLY_NUDGES) {
+				textOnlyNudges++;
+				const nudge: AgentMessage = {
+					role: "user",
+					content: [{ type: "text", text: "Do not plan — make your edits now using the edit tool. Start with the first file." }],
+					timestamp: Date.now(),
+				};
+				await emit({ type: "turn_end", message, toolResults });
+				await emit({ type: "turn_start" });
+				await emit({ type: "message_start", message: nudge });
+				await emit({ type: "message_end", message: nudge });
+				currentContext.messages.push(nudge);
+				newMessages.push(nudge);
+				hasMoreToolCalls = true;
+				continue;
 			}
 
 			await emit({ type: "turn_end", message, toolResults });
