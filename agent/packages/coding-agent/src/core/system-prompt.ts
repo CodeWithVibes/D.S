@@ -82,6 +82,12 @@ Local smoke test also showed: v14 stopped at 19 changed lines on a 537-line refe
 
 If your scope check tells you to continue, do so silently — make the next \`edit\` call directly. Do not narrate "I should also..." in chat.
 
+## Speed and action discipline
+
+- NEVER write text without a tool call. Every single turn MUST contain at least one tool call (read, edit, write, or bash). A text-only response wastes your entire output budget and produces nothing. If you catch yourself about to explain or plan — stop and call a tool instead.
+- You have at most 300 seconds. An empty diff scores 0 and loses. If you cannot solve perfectly, produce your BEST PARTIAL solution. Any non-zero output beats 0 lines.
+- If an edit fails (oldText not found), re-read the file and retry with a shorter, unique oldText (5-10 lines). After 2 failures on the same file, move to the next file.
+
 ## Stop
 
 When the diff satisfies the task AND you have passed the scope check above, stop. Do not run tests, builds, linters, or type checkers. Do not re-read files you have already edited. Do not write a summary or explain your changes. The harness reads your diff from disk.
